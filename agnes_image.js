@@ -51,9 +51,9 @@
 
 const agnesImage = (() => {
   const client = OkHttp.newBuilder()
-    .connectTimeout(180000)
-    .readTimeout(180000)
-    .writeTimeout(180000)
+    .connectTimeout(30000)
+    .readTimeout(360000)
+    .writeTimeout(360000)
     .build();
   const baseDir = getPluginConfigDir("draw");
   const outputDir = `${baseDir}/agnes_image`;
@@ -89,83 +89,94 @@ const agnesImage = (() => {
   }
 
   async function makeImage(params, editing) {
-    const key = (getEnv("AGNES_API_KEY") || "").trim();
-    if (!key) throw new Error("请在包的环境变量中设置 AGNES_API_KEY。");
-    const prompt = String(params?.prompt || "").trim();
-    if (!prompt) throw new Error("prompt 不能为空。");
-    const paths = toList(params.image_paths, "image_paths");
-    const urls = toList(params.image_urls, "image_urls");
-    if (editing && paths.length + urls.length === 0) {
-      throw new Error("至少提供一张参考图：image_paths 或 image_urls。");
-    }
-    if (!editing && paths.length + urls.length > 0) {
-      throw new Error("文生图不接受参考图；需要参考图请调用 edit_image。");
-    }
-    const size = params.size || "1K";
-    const ratio = params.ratio || "1:1";
-    if (!allowedSizes.includes(size)) throw new Error(`不支持的 size：${size}`);
-    if (!allowedRatios.includes(ratio)) throw new Error(`不支持的 ratio：${ratio}`);
+    const startedAt = Date.now();
+    let stage = "校验参数";
+    try {
+      const key = (getEnv("AGNES_API_KEY") || "").trim();
+      if (!key) throw new Error("请在包的环境变量中设置 AGNES_API_KEY。");
+      const prompt = String(params?.prompt || "").trim();
+      if (!prompt) throw new Error("prompt 不能为空。");
+      const paths = toList(params.image_paths, "image_paths");
+      const urls = toList(params.image_urls, "image_urls");
+      if (editing && paths.length + urls.length === 0) {
+        throw new Error("至少提供一张参考图：image_paths 或 image_urls。");
+      }
+      if (!editing && paths.length + urls.length > 0) {
+        throw new Error("文生图不接受参考图；需要参考图请调用 edit_image。");
+      }
+      const size = params.size || "1K";
+      const ratio = params.ratio || "1:1";
+      if (!allowedSizes.includes(size)) throw new Error(`不支持的 size：${size}`);
+      if (!allowedRatios.includes(ratio)) throw new Error(`不支持的 ratio：${ratio}`);
 
-    const images = [];
-    for (const path of paths) {
-      const mime = mimeFor(path);
-      const result = await Tools.Files.readBinary(path);
-      const data = result?.contentBase64;
-      if (!data) throw new Error(`无法读取参考图：${path}`);
-      images.push(`data:${mime};base64,${data}`);
-    }
-    for (const url of urls) {
-      if (!url.startsWith("https://")) throw new Error(`参考图需要公开 HTTPS 链接：${url}`);
-      images.push(url);
-    }
+      stage = "读取参考图";
+      const images = [];
+      for (const path of paths) {
+        const mime = mimeFor(path);
+        const result = await Tools.Files.readBinary(path);
+        const data = result?.contentBase64;
+        if (!data) throw new Error(`无法读取参考图：${path}`);
+        images.push(`data:${mime};base64,${data}`);
+      }
+      for (const url of urls) {
+        if (!url.startsWith("https://")) throw new Error(`参考图需要公开 HTTPS 链接：${url}`);
+        images.push(url);
+      }
 
-    const body = {
-      model: "agnes-image-2.5-flash",
-      prompt,
-      size,
-      ratio
-    };
-    if (editing) {
-      body.extra_body = { image: images, response_format: "b64_json" };
-    } else {
-      body.return_base64 = true;
-    }
-    const request = client.newRequest()
-      .url(apiEndpoint())
-      .method("POST")
-      .headers({
-        "Accept": "application/json",
-        "Content-Type": "application/json",
-        "Authorization": `Bearer ${key}`
-      })
-      .body(JSON.stringify(body), "json");
-    const response = await request.build().execute();
-    if (!response.isSuccessful()) {
-      throw new Error(`Agnes 图片接口返回 HTTP ${response.statusCode}：${String(response.content || "").slice(0, 500)}`);
-    }
-    let data;
-    try { data = JSON.parse(response.content); }
-    catch (_) { throw new Error("Agnes 返回的内容不是 JSON。"); }
-    const item = data?.data?.[0];
-    if (!item) throw new Error("Agnes 响应缺少 data[0]。");
+      const body = {
+        model: "agnes-image-2.5-flash",
+        prompt,
+        size,
+        ratio
+      };
+      if (editing) {
+        body.extra_body = { image: images, response_format: "b64_json" };
+      } else {
+        body.return_base64 = true;
+      }
+      const request = client.newRequest()
+        .url(apiEndpoint())
+        .method("POST")
+        .headers({
+          "Accept": "application/json",
+          "Content-Type": "application/json",
+          "Authorization": `Bearer ${key}`
+        })
+        .body(JSON.stringify(body), "json");
+      stage = "请求 Agnes 生成图片";
+      const response = await request.build().execute();
+      if (!response.isSuccessful()) {
+        throw new Error(`Agnes 图片接口返回 HTTP ${response.statusCode}：${String(response.content || "").slice(0, 500)}`);
+      }
+      stage = "解析 Agnes 响应";
+      let data;
+      try { data = JSON.parse(response.content); }
+      catch (_) { throw new Error("Agnes 返回的内容不是 JSON。"); }
+      const item = data?.data?.[0];
+      if (!item) throw new Error("Agnes 响应缺少 data[0]。");
 
-    await Tools.Files.mkdir(baseDir);
-    await Tools.Files.mkdir(outputDir);
-    const path = `${outputDir}/agnes_${editing ? "edit" : "generate"}_${Date.now()}.png`;
-    if (item.b64_json) {
-      const base64 = item.b64_json.replace(/^data:[^,]+,/, "");
-      const saved = await Tools.Files.writeBinary(path, base64);
-      if (!saved.successful) throw new Error(`保存图片失败：${saved.details}`);
-    } else if (item.url) {
-      const saved = await Tools.Files.download(item.url, path);
-      if (!saved.successful) throw new Error(`下载图片失败：${saved.details}`);
-    } else {
-      throw new Error("Agnes 响应缺少图片数据或链接。");
-    }
+      stage = "保存生成结果";
+      await Tools.Files.mkdir(baseDir);
+      await Tools.Files.mkdir(outputDir);
+      const path = `${outputDir}/agnes_${editing ? "edit" : "generate"}_${Date.now()}.png`;
+      if (item.b64_json) {
+        const base64 = item.b64_json.replace(/^data:[^,]+,/, "");
+        const saved = await Tools.Files.writeBinary(path, base64);
+        if (!saved.successful) throw new Error(`保存图片失败：${saved.details}`);
+      } else if (item.url) {
+        const saved = await Tools.Files.download(item.url, path);
+        if (!saved.successful) throw new Error(`下载图片失败：${saved.details}`);
+      } else {
+        throw new Error("Agnes 响应缺少图片数据或链接。");
+      }
 
-    const markdown = `![Agnes 图生图结果](file://${path})`;
-    return { path, markdown, model: body.model, reference_count: images.length,
-      hint: `图片已保存：${path}\n请在回复中输出：${markdown}` };
+      const markdown = `![Agnes 图生图结果](file://${path})`;
+      return { path, markdown, model: body.model, reference_count: images.length,
+        hint: `图片已保存：${path}\n请在回复中输出：${markdown}` };
+    } catch (error) {
+      const seconds = ((Date.now() - startedAt) / 1000).toFixed(1);
+      throw new Error(`${stage}失败（耗时 ${seconds} 秒）：${error?.message || error}`);
+    }
   }
 
   async function editImageWrapper(params) {
